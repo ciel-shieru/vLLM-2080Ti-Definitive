@@ -81,12 +81,12 @@ jobs:
           } >> "${GITHUB_OUTPUT}"
           {
             echo "### Docker image build"
-            echo "- Requested Git ref: `${SELECTED_REF}`"
-            echo "- Resolved commit: `${commit_sha}`"
-            echo "- Image tag: `${image}`"
-            echo "- max_jobs: `${MAX_JOBS}`"
-            echo "- nvcc_threads: `2`"
-            echo "- torch_cuda_arch_list: `7.5`"
+            echo "- Requested Git ref: ${SELECTED_REF}"
+            echo "- Resolved commit: ${commit_sha}"
+            echo "- Image tag: ${image}"
+            echo "- max_jobs: ${MAX_JOBS}"
+            echo "- nvcc_threads: 2"
+            echo "- torch_cuda_arch_list: 7.5"
           } >> "${GITHUB_STEP_SUMMARY}"
 
       - name: Configure BuildKit parallelism
@@ -131,6 +131,6 @@ jobs:
 
           {
             echo
-            echo "Build completed successfully. The image is tagged locally as `${IMAGE}`."
+            echo "Build completed successfully. The image is tagged locally as ${IMAGE}."
             echo "The workflow does not push the image to a registry; the GitHub-hosted runner is ephemeral."
           } >> "${GITHUB_STEP_SUMMARY}"
