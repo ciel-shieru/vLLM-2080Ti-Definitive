@@ -1,0 +1,132 @@
+name: Build vLLM Docker image
+
+on:
+  workflow_dispatch:
+    inputs:
+      git_ref:
+        description: Git branch, tag, or commit SHA to build
+        required: true
+        default: main
+        type: string
+      max_jobs:
+        description: Ninja jobs for the C++/CUDA build (1 recommended for a 16 GiB runner)
+        required: true
+        default: 1
+        type: number
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build ${{ inputs.git_ref }} (max_jobs=${{ inputs.max_jobs }})
+    runs-on: ubuntu-24.04
+    timeout-minutes: 360
+    permissions:
+      contents: read
+    env:
+      IMAGE_NAME: vllm-2080ti-definitive
+      SELECTED_REF: ${{ inputs.git_ref }}
+      MAX_JOBS: ${{ inputs.max_jobs }}
+
+    steps:
+      - name: Validate inputs
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ -z "${SELECTED_REF//[[:space:]]/}" ]]; then
+            echo "::error::git_ref must not be empty."
+            exit 1
+          fi
+
+      - name: Check out selected ref
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ inputs.git_ref }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Reclaim runner disk space
+        shell: bash
+        run: |
+          set -euo pipefail
+          df -h /
+          # Remove large preinstalled toolchains not needed by this Linux Docker build.
+          sudo rm -rf \
+            /usr/share/dotnet \
+            /usr/local/lib/android \
+            /usr/local/share/powershell \
+            /opt/ghc \
+            /opt/hostedtoolcache/CodeQL
+          df -h /
+
+      - name: Derive image tag and record selected ref
+        id: metadata
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Convert a branch/tag/SHA to a valid Docker tag. Docker tags cannot
+          # contain '/' or arbitrary ref punctuation.
+          image_tag="$(python3 -c 'import re,sys; s=sys.argv[1].replace("/", "-"); s=re.sub(r"[^A-Za-z0-9_.-]+", "-", s).strip(".-"); s=s[:128]; print(s if s and re.match(r"^[A-Za-z0-9_]", s) else ("_" + s if s else "ref"))' "${SELECTED_REF}")"
+          image="${IMAGE_NAME}:${image_tag}"
+          commit_sha="$(git rev-parse HEAD)"
+          {
+            echo "tag=${image_tag}"
+            echo "image=${image}"
+            echo "commit=${commit_sha}"
+          } >> "${GITHUB_OUTPUT}"
+          {
+            echo "### Docker image build"
+            echo "- Requested Git ref: ${SELECTED_REF}"
+            echo "- Resolved commit: ${commit_sha}"
+            echo "- Image tag: ${image}"
+            echo "- max_jobs: ${MAX_JOBS}"
+            echo "- nvcc_threads: 2"
+            echo "- torch_cuda_arch_list: 7.5"
+          } >> "${GITHUB_STEP_SUMMARY}"
+
+      - name: Configure BuildKit parallelism
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat > "${RUNNER_TEMP}/buildkitd.toml" <<'BUILDKIT_CONFIG'
+          [worker.oci]
+            max-parallelism = 1
+          BUILDKIT_CONFIG
+          docker buildx create \
+            --name "vllm-${GITHUB_RUN_ID}" \
+            --driver docker-container \
+            --buildkitd-config "${RUNNER_TEMP}/buildkitd.toml" \
+            --use
+          docker buildx inspect --bootstrap
+
+      - name: Build Docker image
+        shell: bash
+        env:
+          IMAGE: ${{ steps.metadata.outputs.image }}
+          COMMIT_SHA: ${{ steps.metadata.outputs.commit }}
+          BUILD_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          docker buildx build \
+            --progress=plain \
+            --load \
+            --tag "${IMAGE}" \
+            --build-arg "max_jobs=${MAX_JOBS}" \
+            --build-arg "nvcc_threads=2" \
+            --build-arg "torch_cuda_arch_list=7.5" \
+            --build-arg "VLLM_BUILD_COMMIT=${COMMIT_SHA}" \
+            --build-arg "VLLM_BUILD_PIPELINE=github-actions" \
+            --build-arg "VLLM_BUILD_URL=${BUILD_URL}" \
+            --build-arg "VLLM_IMAGE_TAG=${IMAGE}" \
+            --file ./docker/Dockerfile \
+            .
+
+          docker image inspect "${IMAGE}" --format \
+            'tag={{index .RepoTags 0}} size={{.Size}} revision={{index .Config.Labels "org.opencontainers.image.revision"}} version={{index .Config.Labels "org.opencontainers.image.version"}}'
+
+          {
+            echo
+            echo "Build completed successfully. The image is tagged locally as ${IMAGE}."
+            echo "The workflow does not push the image to a registry; the GitHub-hosted runner is ephemeral."
+          } >> "${GITHUB_STEP_SUMMARY}"
