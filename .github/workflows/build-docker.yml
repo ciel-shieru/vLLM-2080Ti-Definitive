@@ -38,10 +38,6 @@ jobs:
             echo "::error::git_ref must not be empty."
             exit 1
           fi
-          if ! [[ "${MAX_JOBS}" =~ ^[12]$ ]]; then
-            echo "::error::max_jobs must be 1 or 2. Use 1 to reduce memory pressure on the 16 GiB runner."
-            exit 1
-          fi
 
       - name: Check out selected ref
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
