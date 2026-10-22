@@ -16,6 +16,12 @@
     "NCCL_VERSION": {
       "default": "2.30.7"
     },
+    "FLASHQLA_REPO": {
+      "default": "https://github.com/weicj/FlashQLA-SM70-SM75.git"
+    },
+    "FLASHQLA_COMMIT": {
+      "default": "3ab27d77d8ca01d7a4718903b726add1a8886c0e"
+    },
     "BUILD_BASE_IMAGE": {
       "default": "pytorch/manylinux2_28-builder:cuda13.0-78e737ad29420ffc4800e677c51e2a852caf8359"
     },
