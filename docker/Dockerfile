@@ -32,6 +32,9 @@ ARG TRITON_INSTALL_FROM_SOURCE_REVISION=
 # This version is used for CUDA 12+ builds to keep the DeepEP build and
 # runtime NCCL versions compatible.
 ARG NCCL_VERSION=2.30.7
+# Pin the external SM70/SM75 FlashQLA source so container builds are reproducible.
+ARG FLASHQLA_REPO=https://github.com/weicj/FlashQLA-SM70-SM75.git
+ARG FLASHQLA_COMMIT=3ab27d77d8ca01d7a4718903b726add1a8886c0e
 
 # By parameterizing the base images, we allow third-party to use their own
 # base images. One use case is hermetic builds with base images stored in
@@ -248,6 +251,11 @@ RUN --mount=type=cache,target=/opt/uv/cache \
         --extra-index-url ${PYTORCH_CUDA_INDEX_BASE_URL}/cu$(echo $CUDA_VERSION | cut -d. -f1,2 | tr -d '.'); \
     fi
 
+# Apply the fork's PyTorch 2.13 E8M0 functionalization backport in the build environment.
+COPY tools/patch_torch_inductor_e8m0.py tools/check_torch_inductor_e8m0.py tools/
+RUN python3 tools/patch_torch_inductor_e8m0.py \
+    && python3 tools/check_torch_inductor_e8m0.py
+
 # CUDA 13.4 Rubin images need a compatibility link for the prerelease
 # PyTorch wheel's libcurand.so.11 dependency. CUDA 13.5 must use its native
 # libcurand.so.11 instead.
@@ -292,6 +300,37 @@ RUN --mount=type=cache,target=/opt/uv/cache \
 ARG torch_cuda_arch_list='7.5 8.0 8.6 8.9 9.0 10.0 11.0 12.0'
 ENV TORCH_CUDA_ARCH_LIST=${torch_cuda_arch_list}
 #################### BUILD BASE IMAGE ####################
+
+#################### SM75 FLASHQLA SOURCE IMAGE ####################
+# Keep only the patched source in this stage. Compile its extension in
+# vllm-base later so its .so and build metadata match the exact runtime
+# Python/PyTorch/CUDA paths used by the final image.
+FROM base AS flashqla-source
+
+ARG FLASHQLA_REPO
+ARG FLASHQLA_COMMIT
+
+ENV FLASHQLA_ROOT=/opt/FlashQLA-SM70-SM75
+
+WORKDIR /workspace
+COPY tools/patch_flashqla_sm75_imports.py /tmp/patch_flashqla_sm75_imports.py
+COPY tools/flashqla_sm75_patches/ /tmp/flashqla-sm75-patches/
+
+RUN set -eux; \
+    git init "${FLASHQLA_ROOT}"; \
+    git -C "${FLASHQLA_ROOT}" remote add origin "${FLASHQLA_REPO}"; \
+    git -C "${FLASHQLA_ROOT}" fetch --depth=1 origin "${FLASHQLA_COMMIT}"; \
+    git -C "${FLASHQLA_ROOT}" checkout --detach FETCH_HEAD; \
+    test "$(git -C "${FLASHQLA_ROOT}" rev-parse HEAD)" = "${FLASHQLA_COMMIT}"; \
+    python3 /tmp/patch_flashqla_sm75_imports.py \
+        "${FLASHQLA_ROOT}" /tmp/flashqla-sm75-patches; \
+    test -f "${FLASHQLA_ROOT}/flash_qla/ops/gated_delta_rule/legacy/sm_legacy.py"; \
+    rm -rf "${FLASHQLA_ROOT}/.git" \
+        "${FLASHQLA_ROOT}/benchmark" "${FLASHQLA_ROOT}/tests"; \
+    find "${FLASHQLA_ROOT}" -type d -name __pycache__ -prune -exec rm -rf {} +
+
+#################### SM75 FLASHQLA SOURCE IMAGE ####################
+
 
 #################### RUST BUILD IMAGE ####################
 # Build the Rust frontend (`vllm-rs`) in a dedicated stage so the main wheel
@@ -780,6 +819,7 @@ RUN apt-get update -y \
         python${PYTHON_VERSION}-dev \
         python${PYTHON_VERSION}-venv \
         libibverbs-dev \
+        g++ \
     && rm -rf /var/lib/apt/lists/* \
     && update-alternatives --install /usr/bin/python3 python3 /usr/bin/python${PYTHON_VERSION} 1 \
     && update-alternatives --set python3 /usr/bin/python${PYTHON_VERSION} \
@@ -795,6 +835,7 @@ RUN CUDA_VERSION_DASH=$(echo $CUDA_VERSION | cut -d. -f1,2 | tr '.' '-') && \
     apt-get install -y --no-install-recommends --allow-change-held-packages \
         cuda-nvcc-${CUDA_VERSION_DASH} \
         cuda-cudart-${CUDA_VERSION_DASH} \
+        cuda-cudart-dev-${CUDA_VERSION_DASH} \
         cuda-nvrtc-${CUDA_VERSION_DASH} \
         # FlashInfer's runtime JIT-compiled kernels (e.g. trtllm_fmha_kernel_launcher.cu)
         # #include <nvrtc.h>, which only the -dev package ships.
@@ -956,6 +997,12 @@ RUN --mount=type=cache,target=/opt/uv/cache \
     fi && \
     rm /tmp/requirements-cuda.txt /tmp/common.txt
 
+# Apply the same fork-specific PyTorch patch to the actual runtime interpreter.
+COPY tools/patch_torch_inductor_e8m0.py tools/check_torch_inductor_e8m0.py /tmp/
+RUN python3 /tmp/patch_torch_inductor_e8m0.py \
+    && python3 /tmp/check_torch_inductor_e8m0.py \
+    && rm /tmp/patch_torch_inductor_e8m0.py /tmp/check_torch_inductor_e8m0.py
+
 # Install FlashInfer JIT cache (requires CUDA-version-specific index URL)
 # https://docs.flashinfer.ai/installation.html
 # From versions.json: .flashinfer.version
@@ -965,6 +1012,9 @@ RUN --mount=type=cache,target=/opt/uv/cache \
         uv pip install --system flashinfer-jit-cache==${FLASHINFER_VERSION} \
             --index-url https://flashinfer.ai/whl/cu$(echo $CUDA_VERSION | cut -d. -f1,2 | tr -d '.'); \
     fi
+
+# Match the fork launcher's use of the version-aligned FlashInfer AOT cache.
+ENV FLASHINFER_ENABLE_AOT=1
 
 # ============================================================
 # OPENAI API SERVER DEPENDENCIES
@@ -1009,6 +1059,63 @@ RUN --mount=type=cache,target=/opt/uv/cache \
 # ============================================================
 
 FROM vllm-runtime-base AS vllm-base
+
+ARG FLASHQLA_COMMIT
+ARG max_jobs=2
+ARG nvcc_threads=8
+
+COPY --from=flashqla-source /opt/FlashQLA-SM70-SM75/flash_qla /opt/FlashQLA-SM70-SM75/flash_qla
+COPY --from=flashqla-source /opt/FlashQLA-SM70-SM75/setup.py /opt/FlashQLA-SM70-SM75/setup.py
+COPY --from=flashqla-source /opt/FlashQLA-SM70-SM75/LICENSE /opt/FlashQLA-SM70-SM75/LICENSE
+COPY --from=flashqla-source /opt/FlashQLA-SM70-SM75/README.md /opt/FlashQLA-SM70-SM75/README.md
+
+ENV FLASHQLA_ROOT=/opt/FlashQLA-SM70-SM75
+ENV TORCH_EXTENSIONS_DIR=/opt/FlashQLA-SM70-SM75/.torch_extensions_vllm_flashqla_legacy
+ENV TORCH_CUDA_ARCH_LIST=7.5
+ENV MAX_JOBS=${max_jobs}
+ENV NVCC_THREADS=${nvcc_threads}
+ENV PYTHONPATH=/opt/FlashQLA-SM70-SM75
+ENV PYTHONSAFEPATH=1
+ENV FLASHINFER_ENABLE_AOT=1
+ENV FLASHINFER_WORKSPACE_BASE=/var/cache/vllm/flashinfer
+ENV VLLM_DISABLE_TILELANG=1
+
+LABEL ai.vllm.flashqla.commit="${FLASHQLA_COMMIT}"
+
+RUN mkdir -p /var/cache/vllm/flashinfer
+
+RUN --mount=type=cache,target=/opt/uv/cache \
+    uv pip install --system ninja \
+    && uv pip install --system --no-deps -e "${FLASHQLA_ROOT}" \
+    && python3 - <<'PY'
+import os
+from pathlib import Path
+
+import torch
+from torch.utils.cpp_extension import load
+
+root = Path(os.environ["FLASHQLA_ROOT"])
+source = root / "flash_qla" / "ops" / "gated_delta_rule" / "legacy" / "csrc" / "gdn_forward.cu"
+extension = load(
+    name="flash_qla_legacy_gdn",
+    sources=[str(source)],
+    extra_cflags=["-O3"],
+    extra_cuda_cflags=["-O3"],
+    verbose=True,
+)
+required = ("gdn_forward", "gdn_forward_varlen")
+missing = [name for name in required if not hasattr(extension, name)]
+if missing:
+    raise SystemExit("FlashQLA SM75 extension is missing symbols: " + ", ".join(missing))
+print(f"FlashQLA SM70/SM75 extension: {extension.__file__}")
+print("FlashQLA symbols: " + ", ".join(required))
+print(f"PyTorch: {torch.__version__}; CUDA runtime: {torch.version.cuda}")
+PY
+
+# PyTorch's JIT extension loader may touch a lock even when reusing the compiled
+# .so. Permit the documented image UID/GID 2000:0 to update cache metadata.
+RUN chgrp -R 0 "${TORCH_EXTENSIONS_DIR}" /var/cache/vllm/flashinfer \
+    && chmod -R g+rwX "${TORCH_EXTENSIONS_DIR}" /var/cache/vllm/flashinfer
 
 ARG PIP_INDEX_URL UV_INDEX_URL
 ARG PIP_EXTRA_INDEX_URL UV_EXTRA_INDEX_URL

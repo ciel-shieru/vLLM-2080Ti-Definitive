@@ -20,7 +20,15 @@ variable "NVCC_THREADS" {
 }
 
 variable "TORCH_CUDA_ARCH_LIST" {
-  default = "8.0 8.9 9.0 10.0 11.0 12.0"
+  default = "7.5 8.0 8.6 8.9 9.0 10.0 11.0 12.0"
+}
+
+variable "FLASHQLA_REPO" {
+  default = "https://github.com/weicj/FlashQLA-SM70-SM75.git"
+}
+
+variable "FLASHQLA_COMMIT" {
+  default = "3ab27d77d8ca01d7a4718903b726add1a8886c0e"
 }
 
 variable "COMMIT" {
@@ -62,6 +70,8 @@ target "_common" {
     max_jobs             = MAX_JOBS
     nvcc_threads         = NVCC_THREADS
     torch_cuda_arch_list = TORCH_CUDA_ARCH_LIST
+    FLASHQLA_REPO        = FLASHQLA_REPO
+    FLASHQLA_COMMIT      = FLASHQLA_COMMIT
     VLLM_BUILD_COMMIT    = VLLM_BUILD_COMMIT != "unknown" ? VLLM_BUILD_COMMIT : (COMMIT != "" ? COMMIT : "unknown")
     VLLM_BUILD_PIPELINE  = VLLM_BUILD_PIPELINE
     VLLM_BUILD_URL       = VLLM_BUILD_URL
